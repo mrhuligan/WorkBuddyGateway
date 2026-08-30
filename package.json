@@ -1,0 +1,11 @@
+{
+  "name": "wb-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node wb-gateway.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

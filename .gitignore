@@ -1,0 +1,7 @@
+node_modules/
+accounts.json
+wb-token.json
+traffic.log
+flows/
+*.log
+WorkBuddyAI/
