@@ -168,10 +168,14 @@ async function handleChat(req, res, body) {
     const reader = up.body.getReader();
     const decoder = new TextDecoder();
     let buf = "";
-    const cleanDelta = (delta) => {
-      if (!delta) return;
-      if (delta.reasoning_content === "") delete delta.reasoning_content;
-      if (delta.content === "") delete delta.content;
+    const cleanDelta = (d) => {
+      if (!d) return;
+      if (d.content === "" || d.content === null) delete d.content;
+      if (d.reasoning_content === "" || d.reasoning_content === null) delete d.reasoning_content;
+      if (Array.isArray(d.tool_calls) && d.tool_calls.length === 0) delete d.tool_calls;
+      if (d.function_call === null) delete d.function_call;
+      if (d.refusal === "" || d.refusal === null) delete d.refusal;
+      if (d.extra_fields === null) delete d.extra_fields;
     };
     try {
       for (;;) {
@@ -181,8 +185,7 @@ async function handleChat(req, res, body) {
         const lines = buf.split("\n");
         buf = lines.pop();
         for (let line of lines) {
-          const crlf = line.endsWith("\r");
-          if (crlf) line = line.slice(0, -1);
+          if (line.endsWith("\r")) line = line.slice(0, -1);
           if (line.startsWith("data:")) {
             const payload = line.slice(5).trim();
             if (payload !== "[DONE]") {
@@ -195,7 +198,7 @@ async function handleChat(req, res, body) {
               } catch {}
             }
           }
-          res.write(line + (crlf ? "\r\n" : "\n"));
+          res.write(line + "\n");
         }
       }
     } catch (e) { res.end(); return; }
