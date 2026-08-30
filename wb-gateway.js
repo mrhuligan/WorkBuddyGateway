@@ -166,11 +166,37 @@ async function handleChat(req, res, body) {
   if (j.stream) {
     res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" });
     const reader = up.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    const cleanDelta = (delta) => {
+      if (!delta) return;
+      if (delta.reasoning_content === "") delete delta.reasoning_content;
+      if (delta.content === "") delete delta.content;
+    };
     try {
       for (;;) {
         const r = await reader.read();
         if (r.done) break;
-        res.write(Buffer.from(r.value));
+        buf += decoder.decode(r.value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop();
+        for (let line of lines) {
+          const crlf = line.endsWith("\r");
+          if (crlf) line = line.slice(0, -1);
+          if (line.startsWith("data:")) {
+            const payload = line.slice(5).trim();
+            if (payload !== "[DONE]") {
+              try {
+                const chunk = JSON.parse(payload);
+                if (chunk.choices) {
+                  for (const ch of chunk.choices) cleanDelta(ch.delta);
+                }
+                line = "data: " + JSON.stringify(chunk);
+              } catch {}
+            }
+          }
+          res.write(line + (crlf ? "\r\n" : "\n"));
+        }
       }
     } catch (e) { res.end(); return; }
     res.end();
