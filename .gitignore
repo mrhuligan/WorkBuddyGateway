@@ -4,4 +4,6 @@ wb-token.json
 traffic.log
 flows/
 *.log
+*.rar
+.opencode/
 WorkBuddyAI/

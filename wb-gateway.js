@@ -12,6 +12,8 @@ const TOKEN_FILE = path.join(DIR, "wb-token.json");
 const INDEX_FILE = path.join(DIR, "index.html");
 const UA = "WorkBuddy/5.3.11 WorkBuddy/5.3.11 CLI/2.115.0";
 const DEFAULT_SYSTEM = "You are a helpful assistant.";
+const COOLDOWN_MS = 12 * 60 * 60 * 1000;
+const QUOTA_ERR_CODES = [4006];
 
 const MODELS = [
   "default-model", "fast-model", "balanced-model", "primary-model", "deep-model",
@@ -19,6 +21,18 @@ const MODELS = [
   "gpt-5.5", "gpt-5.4", "gpt-5.3-codex", "gemini-3.5-flash",
   "glm-5.3", "glm-5.2", "kimi-k3", "kimi-k2.6", "minimax-m3",
 ];
+
+// Local aliases -> real upstream model id.
+// Needed because opencode's builtin model catalog hardcodes capabilities for
+// some ids (e.g. hy4-preview is marked text-only there, which blocks image
+// attachments). A non-colliding alias lets local config define modalities.
+const MODEL_ALIAS = {
+  "hy4-preview-local": "hy4-preview",
+  "hy4-vision": "hy4-preview",
+  "hy3-local": "hy3",
+  "hy3-vision": "hy3",
+};
+const resolveModel = (m) => MODEL_ALIAS[m] || m;
 
 function loadAccounts() {
   if (fs.existsSync(ACCOUNTS_FILE)) {
@@ -33,6 +47,21 @@ function loadAccounts() {
   return [];
 }
 function saveAccounts(a) { fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(a, null, 1)); }
+
+const cooldown = new Map();
+const banned = () => Date.now() + COOLDOWN_MS;
+const isCooling = (name) => (cooldown.get(name) || 0) > Date.now();
+const coolLeft = (name) => Math.max(0, (cooldown.get(name) || 0) - Date.now());
+
+function pickAccount() {
+  const accounts = loadAccounts();
+  const ready = accounts.find((a) => !isCooling(a.name));
+  if (ready) return { acc: ready, allBusy: false };
+  const soonest = accounts
+    .slice()
+    .sort((a, b) => coolLeft(a.name) - coolLeft(b.name))[0];
+  return { acc: soonest || null, allBusy: true };
+}
 
 function jwtPayload(token) {
   try { return JSON.parse(Buffer.from(token.split(".")[1], "base64").toString("utf8")); } catch { return {}; }
@@ -125,17 +154,12 @@ async function handleChat(req, res, body) {
     return json(res, 400, { error: { message: "messages required" } });
 
   const accounts = loadAccounts();
-  if (!accounts.length) return json(res, 401, { error: { message: "no accounts, add one via /v1/login or the web UI" } });
-  let acc = accounts[0];
-  if (j.account) {
-    acc = accounts.find((a) => a.name === j.account);
-    if (!acc) return json(res, 404, { error: { message: "account not found: " + j.account } });
-  }
+  if (!accounts.length) return json(res, 401, { error: { message: "no accounts, login via /v1/login or the web UI" } });
 
   fixSystemOrder(j.messages);
 
   const wbBody = {
-    model: j.model || "default-model",
+    model: resolveModel(j.model || "default-model"),
     messages: j.messages,
     stream: true,
     stream_options: { include_usage: true },
@@ -144,27 +168,79 @@ async function handleChat(req, res, body) {
   for (const k of passthrough) {
     if (j[k] !== undefined) wbBody[k] = j[k];
   }
+  const payload = JSON.stringify(wbBody);
 
-  let up;
-  try {
-    up = await fetch(BASE + "/v2/chat/completions", {
-      method: "POST",
-      headers: wbHeaders(acc),
-      body: JSON.stringify(wbBody),
-    });
-  } catch (e) {
-    return json(res, 502, { error: { message: "upstream fetch failed: " + e.message } });
+  let queue;
+  if (j.account) {
+    const forced = accounts.find((a) => a.name === j.account);
+    if (!forced) return json(res, 404, { error: { message: "account not found: " + j.account } });
+    queue = [forced];
+  } else {
+    const seen = new Set();
+    queue = [];
+    const ordered = accounts
+      .slice()
+      .sort((a, b) => coolLeft(a.name) - coolLeft(b.name));
+    for (const a of ordered) {
+      if (!seen.has(a.name)) { seen.add(a.name); queue.push(a); }
+    }
   }
 
-  if (!up.ok) {
-    const t = await up.text();
+  let up = null;
+  let acc = null;
+  let lastErr = null;
+  let lastCode = null;
+  let lastStatus = 502;
+
+  for (const cand of queue) {
+    if (!j.account && isCooling(cand.name)) continue;
+    let r;
+    try {
+      r = await fetch(BASE + "/v2/chat/completions", {
+        method: "POST",
+        headers: wbHeaders(cand),
+        body: payload,
+      });
+    } catch (e) {
+      lastErr = "upstream fetch failed: " + e.message;
+      cooldown.set(cand.name, banned());
+      console.log("[chat] network fail on " + cand.name + ", cooldown 12h");
+      continue;
+    }
+
+    if (r.ok) { up = r; acc = cand; break; }
+
+    const t = await r.text();
     let code = null;
     try { code = JSON.parse(t).code; } catch {}
-    return json(res, up.status, { error: { message: t.slice(0, 500), code: code } });
+    lastErr = t.slice(0, 500);
+    lastCode = code;
+    lastStatus = r.status;
+
+    if (QUOTA_ERR_CODES.includes(code)) {
+      cooldown.set(cand.name, banned());
+      console.log("[chat] " + cand.name + " -> code " + code + ", cooldown 12h, switching");
+      continue;
+    }
+    break;
   }
 
+  if (!up) {
+    if (lastErr === null) {
+      return json(res, 503, {
+        error: {
+          message: "all accounts are in cooldown (code 4006), retry after " + Math.ceil(coolLeft(queue[0].name) / 1000) + "s",
+          code: 4006,
+        },
+      });
+    }
+    return json(res, lastStatus, { error: { message: lastErr, code: lastCode } });
+  }
+
+  if (acc) res.setHeader("X-WB-Account", acc.name);
+
   if (j.stream) {
-    res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" });
+    res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", "X-WB-Account": acc ? acc.name : "" });
     const reader = up.body.getReader();
     const decoder = new TextDecoder();
     let buf = "";
@@ -187,10 +263,16 @@ async function handleChat(req, res, body) {
         for (let line of lines) {
           if (line.endsWith("\r")) line = line.slice(0, -1);
           if (line.startsWith("data:")) {
-            const payload = line.slice(5).trim();
-            if (payload !== "[DONE]") {
+            const data = line.slice(5).trim();
+            if (data !== "[DONE]") {
               try {
-                const chunk = JSON.parse(payload);
+                const chunk = JSON.parse(data);
+                if (chunk.code !== undefined && QUOTA_ERR_CODES.includes(chunk.code)) {
+                  if (acc) {
+                    cooldown.set(acc.name, banned());
+                    console.log("[chat] " + acc.name + " -> code " + chunk.code + " in stream, cooldown 12h");
+                  }
+                }
                 if (chunk.choices) {
                   for (const ch of chunk.choices) cleanDelta(ch.delta);
                 }
@@ -207,6 +289,13 @@ async function handleChat(req, res, body) {
   }
 
   const txt = await up.text();
+  try {
+    const chk = JSON.parse(txt);
+    if (chk && chk.code !== undefined && QUOTA_ERR_CODES.includes(chk.code) && acc) {
+      cooldown.set(acc.name, banned());
+      console.log("[chat] " + acc.name + " -> code " + chk.code + " in body, cooldown 12h");
+    }
+  } catch {}
   json(res, 200, collectSSE(txt));
 }
 
@@ -261,6 +350,18 @@ async function handleLogin(res) {
   pollLogin(stj.data.state);
 }
 
+const num = (v) => {
+  const n = typeof v === "number" ? v : parseFloat(v);
+  return Number.isFinite(n) ? n : 0;
+};
+
+const normUnit = (u) => {
+  const s = String(u || "").toLowerCase().trim();
+  if (!s) return "credits";
+  if (s === "credit" || s === "credits" || s === "cred" || s === "point" || s === "points" || s === "token" || s === "tokens") return "credits";
+  return s;
+};
+
 async function fetchQuota(acc) {
   const body = { PageNumber: 1, PageSize: 20, ProductCode: "p_tcaca", Status: [], OnlyValidPeriod: true };
   const r = await fetch(BASE + "/v2/billing/meter/get-user-resource", {
@@ -279,13 +380,51 @@ async function fetchQuota(acc) {
     userId: acc.userId,
     packages: list.map((a) => ({
       packageName: a.PackageName,
-      remain: a.CapacityRemainPrecise !== undefined ? a.CapacityRemainPrecise : a.CapacityRemain,
-      used: a.CapacityUsed,
-      size: a.CapacitySize,
+      remain: num(a.CapacityRemainPrecise !== undefined ? a.CapacityRemainPrecise : a.CapacityRemain),
+      used: num(a.CapacityUsed),
+      size: num(a.CapacitySize),
       unit: a.CapacityUnit,
       cycleStart: a.CycleStartTime,
       cycleEnd: a.CycleEndTime,
     })),
+  };
+}
+
+function aggregateQuota(list) {
+  const byPkg = new Map();
+  let total = { unit: "credits", remain: 0, used: 0, size: 0 };
+  let accountsOk = 0, accountsErr = 0, accountsWithPkgs = 0;
+  for (const acc of list) {
+    if (acc.error) { accountsErr++; continue; }
+    accountsOk++;
+    if (acc.packages.length) accountsWithPkgs++;
+    for (const p of acc.packages) {
+      const nu = normUnit(p.unit);
+      const key = (p.packageName || "unknown") + "\u0000" + nu;
+      let e = byPkg.get(key);
+      if (!e) {
+        e = { packageName: p.packageName, unit: nu, remain: 0, used: 0, size: 0, accounts: 0, cycleStart: p.cycleStart, cycleEnd: p.cycleEnd };
+        byPkg.set(key, e);
+      }
+      e.remain += p.remain;
+      e.used += p.used;
+      e.size += p.size;
+      e.accounts++;
+      if (p.cycleEnd && (!e.cycleEnd || p.cycleEnd > e.cycleEnd)) e.cycleEnd = p.cycleEnd;
+      if (p.cycleStart && (!e.cycleStart || p.cycleStart < e.cycleStart)) e.cycleStart = p.cycleStart;
+      if (nu === "credits") {
+        total.remain += p.remain;
+        total.used += p.used;
+        total.size += p.size;
+      }
+    }
+  }
+  return {
+    packages: [...byPkg.values()].sort((a, b) => (b.remain - a.remain)),
+    total,
+    accounts: accountsOk,
+    accountsWithPackages: accountsWithPkgs,
+    accountsFailed: accountsErr,
   };
 }
 
@@ -324,22 +463,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (p === "/v1/accounts" && req.method === "POST") {
-      const j = JSON.parse((await readBody(req)).toString("utf8") || "{}");
-      if (!j.accessToken) return json(res, 400, { error: { message: "accessToken required" } });
-      const pl = jwtPayload(j.accessToken);
-      if (!pl.sub) return json(res, 400, { error: { message: "not a valid WorkBuddy JWT" } });
-      const accounts = loadAccounts();
-      const rec = {
-        name: j.name || pl.email || "account-" + (accounts.length + 1),
-        accessToken: j.accessToken,
-        refreshToken: j.refreshToken || "",
-        userId: pl.sub,
-      };
-      const existing = accounts.find((a) => a.name === rec.name);
-      if (existing) Object.assign(existing, rec);
-      else accounts.push(rec);
-      saveAccounts(accounts);
-      return json(res, 200, { ok: true, name: rec.name });
+      return json(res, 410, { error: { message: "manual token auth is disabled, use /v1/login" } });
     }
 
     if (p === "/v1/accounts/delete" && req.method === "POST") {
@@ -350,16 +474,42 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, removed: accounts.length - next.length });
     }
 
+    if (p === "/v1/status" && req.method === "GET") {
+      const accounts = loadAccounts();
+      const now = Date.now();
+      return json(res, 200, {
+        cooldownMs: COOLDOWN_MS,
+        quotaCodes: QUOTA_ERR_CODES,
+        accounts: accounts.map((a) => ({
+          name: a.name,
+          ready: !isCooling(a.name),
+          cooldownLeftMs: coolLeft(a.name),
+          cooldownUntil: cooldown.has(a.name) ? new Date(cooldown.get(a.name)).toISOString() : null,
+        })),
+        now: new Date(now).toISOString(),
+      });
+    }
+
+    if (p === "/v1/reset-cooldown" && req.method === "POST") {
+      const j = JSON.parse((await readBody(req)).toString("utf8") || "{}");
+      if (j.name) {
+        if (!cooldown.delete(j.name)) return json(res, 404, { error: { message: "no cooldown for " + j.name } });
+      } else {
+        cooldown.clear();
+      }
+      return json(res, 200, { ok: true, cooling: cooldown.size });
+    }
+
     if (p === "/v1/quota" && req.method === "GET") {
       const accounts = loadAccounts();
-      const want = u.searchParams.get("account");
-      const list = want ? accounts.filter((a) => a.name === want) : accounts;
       const out = [];
-      for (const acc of list) {
+      for (const acc of accounts) {
         try { out.push(await fetchQuota(acc)); }
         catch (e) { out.push({ name: acc.name, error: e.message }); }
       }
-      return json(res, 200, out);
+      const agg = aggregateQuota(out);
+      if (u.searchParams.get("raw") === "1") return json(res, 200, { aggregate: agg, accounts: out });
+      return json(res, 200, agg);
     }
 
     json(res, 404, { error: { message: "not found" } });

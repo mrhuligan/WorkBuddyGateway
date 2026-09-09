@@ -19,6 +19,12 @@
   #status { color: #ab8; min-height: 18px; margin: 8px 0; }
   .wide { width: 480px; }
   .pkg { color: #9c9; }
+  .big-balance { background: #18242c; border: 1px solid #2c4452; border-radius: 6px; padding: 14px 18px; margin: 6px 0 16px 0; display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+  .big-balance .v { font-size: 30px; color: #9eecd1; font-weight: bold; }
+  .big-balance .u { font-size: 16px; color: #8ab; }
+  .big-balance .lbl { color: #8ab; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; }
+  .big-balance .sub { color: #789; font-size: 13px; }
+  a { color: #7ab; }
 </style>
 </head>
 <body>
@@ -27,20 +33,17 @@
 
 <h2>Аккаунты</h2>
 <table id="accounts">
-  <tr><th>Имя</th><th>Email</th><th>UserId</th><th></th></tr>
+  <tr><th>Имя</th><th>Email</th><th>UserId</th><th>Статус</th><th></th></tr>
 </table>
 
-<h2>Добавить аккаунт</h2>
-<div class="row">Имя <input id="name" size="20"> Access token <input id="token" class="wide" placeholder="eyJhbGci..."></div>
-<div class="row">Refresh token <input id="refresh" class="wide"> <button onclick="addAccount()">Добавить</button></div>
+<h2>Логин</h2>
+<div class="row"><button onclick="login()">Войти через ссылку</button> <span id="loginState"></span></div>
 
-<h2>Логин через браузер</h2>
-<div class="row"><button onclick="login()">Открыть страницу логина</button> <span id="loginState"></span></div>
-
-<h2>Квота</h2>
-<div class="row"><button onclick="loadQuota()">Обновить квоту</button></div>
+<h2>Общий баланс</h2>
+<div class="row"><button onclick="loadQuota()">Обновить баланс</button></div>
+<div id="total" class="big-balance"></div>
 <table id="quota">
-  <tr><th>Аккаунт</th><th>Пакет</th><th>Осталось</th><th>Использовано</th><th>Всего</th><th>Цикл</th></tr>
+  <tr><th>Пакет</th><th>Осталось</th><th>Использовано</th><th>Всего</th><th>Аккаунтов</th><th>Цикл</th></tr>
 </table>
 
 <script>
@@ -63,13 +66,26 @@ async function jfetch(url, opts) {
 
 async function loadAccounts() {
   const list = await jfetch("/v1/accounts");
+  const st = await jfetch("/v1/status");
+  const cd = {};
+  for (const s of st.accounts) cd[s.name] = s;
   const t = document.getElementById("accounts");
-  t.innerHTML = "<tr><th>Имя</th><th>Email</th><th>UserId</th><th></th></tr>";
+  t.innerHTML = "<tr><th>Имя</th><th>Email</th><th>UserId</th><th>Статус</th><th></th></tr>";
   for (const a of list) {
     const tr = el("tr");
     tr.appendChild(el("td", a.name));
     tr.appendChild(el("td", a.email));
     tr.appendChild(el("td", a.userId));
+    const s = cd[a.name];
+    const stCell = el("td");
+    if (!s || s.ready) {
+      stCell.textContent = "готов";
+      stCell.style.color = "#9c9";
+    } else {
+      stCell.textContent = "кулдаун " + fmtH(s.cooldownLeftMs);
+      stCell.style.color = "#c96";
+    }
+    tr.appendChild(stCell);
     const td = el("td");
     const btn = el("button", "удалить");
     btn.className = "del";
@@ -99,6 +115,17 @@ async function addAccount() {
   } catch (e) { say("ошибка: " + e.message); }
 }
 
+const fmt = (n) => String(Math.round(n * 100) / 100);
+
+function fmtH(ms) {
+  const s = Math.ceil(ms / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (h > 0) return h + "ч " + m + "м";
+  if (m > 0) return m + "м " + (s % 60) + "с";
+  return s + "с";
+}
+
 let loginPoll = null;
 async function login() {
   try {
@@ -123,46 +150,56 @@ async function login() {
 }
 
 async function loadQuota() {
-  say("загружаю квоту...");
+  say("загружаю баланс...");
   try {
-    const list = await jfetch("/v1/quota");
-    const t = document.getElementById("quota");
-    t.innerHTML = "<tr><th>Аккаунт</th><th>Пакет</th><th>Осталось</th><th>Использовано</th><th>Всего</th><th>Цикл</th></tr>";
-    for (const acc of list) {
-      if (acc.error) {
-        const tr = el("tr");
-        tr.appendChild(el("td", acc.name));
-        const td = el("td");
-        td.colSpan = 5;
-        td.textContent = "ошибка: " + acc.error;
-        td.style.color = "#c66";
-        tr.appendChild(td);
-        t.appendChild(tr);
-        continue;
-      }
-      for (const p of acc.packages) {
-        const tr = el("tr");
-        tr.appendChild(el("td", acc.name));
-        const pn = el("td", p.packageName);
-        pn.className = "pkg";
-        tr.appendChild(pn);
-        tr.appendChild(el("td", p.remain + " " + p.unit));
-        tr.appendChild(el("td", p.used));
-        tr.appendChild(el("td", p.size));
-        tr.appendChild(el("td", p.cycleStart + " .. " + p.cycleEnd));
-        t.appendChild(tr);
-      }
-      if (!acc.packages.length) {
-        const tr = el("tr");
-        tr.appendChild(el("td", acc.name));
-        const td = el("td");
-        td.colSpan = 5;
-        td.textContent = "нет активных пакетов";
-        tr.appendChild(td);
-        t.appendChild(tr);
-      }
+    const agg = await jfetch("/v1/quota");
+    const t = document.getElementById("total");
+    t.innerHTML = "";
+    const credits = agg.total || { unit: "credits", remain: 0, used: 0, size: 0 };
+    const remain = el("span", fmt(credits.remain));
+    remain.className = "v";
+    const unit = el("span", credits.unit || "credits");
+    unit.className = "u";
+    const lbl = el("span", "осталось кредитов");
+    lbl.className = "lbl";
+    t.appendChild(lbl);
+    t.appendChild(remain);
+    t.appendChild(unit);
+    const used = el("span", "использовано " + fmt(credits.used));
+    used.className = "sub";
+    t.appendChild(used);
+    const size = el("span", "из " + fmt(credits.size));
+    size.className = "sub";
+    t.appendChild(size);
+    const accs = el("span", "аккаунтов: " + agg.accounts + (agg.accountsWithPackages !== undefined ? " (с пакетами: " + agg.accountsWithPackages + ")" : "") + (agg.accountsFailed ? " / ошибок: " + agg.accountsFailed : ""));
+    accs.className = "sub";
+    t.appendChild(accs);
+
+    const qt = document.getElementById("quota");
+    qt.innerHTML = "";
+    const h2 = el("tr");
+    for (const h of ["Пакет", "Осталось", "Использовано", "Всего", "Аккаунтов", "Цикл"]) h2.appendChild(el("th", h));
+    qt.appendChild(h2);
+    for (const p of agg.packages) {
+      const tr = el("tr");
+      const pn = el("td", p.packageName);
+      pn.className = "pkg";
+      tr.appendChild(pn);
+      tr.appendChild(el("td", fmt(p.remain) + " " + (p.unit || "")));
+      tr.appendChild(el("td", fmt(p.used)));
+      tr.appendChild(el("td", fmt(p.size)));
+      tr.appendChild(el("td", String(p.accounts)));
+      tr.appendChild(el("td", (p.cycleStart || "?") + " .. " + (p.cycleEnd || "?")));
+      qt.appendChild(tr);
     }
-    say("квота обновлена");
+    if (!agg.packages.length) {
+      const tr = el("tr");
+      const td = el("td", "нет активных пакетов");
+      td.colSpan = 6;
+      tr.appendChild(td);
+      qt.appendChild(tr);
+    }
+    say("баланс обновлён");
   } catch (e) { say("ошибка: " + e.message); }
 }
 
